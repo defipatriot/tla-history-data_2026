@@ -1,0 +1,31 @@
+name: TLA History Annotate (one-time)
+
+# One-time: adds the `canonical` flag to the already-seeded lock-events.json +
+# rollups.json (no re-seed). Idempotent. The main backfill writes `canonical`
+# natively now, so this is only needed once for the existing seed.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tla-history-annotate
+  cancel-in-progress: false
+
+jobs:
+  annotate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Annotate canonical flag
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPO: ${{ github.repository }}
+          GITHUB_BRANCH: ${{ github.ref_name }}
+        run: node tla-history-annotate.js
