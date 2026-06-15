@@ -24,9 +24,21 @@ on:
         type: string
         default: "https://terra-rest.publicnode.com"
       seed_max_pages:
-        description: "Hard page ceiling per contract during seed (100 txs/page)"
+        description: "Hard page ceiling per query (100 txs/page). Gauge votes ~70p, escrow ~100p."
         type: string
-        default: "400"
+        default: "600"
+      pager_retries:
+        description: "Probes per page (publicnode is flaky per-request; higher = more robust)."
+        type: string
+        default: "40"
+      pager_err_backoff:
+        description: "Backoff after an error/empty page (ms)."
+        type: string
+        default: "250"
+      pager_probe_delay:
+        description: "Delay between probes of the same page (ms)."
+        type: string
+        default: "40"
 
 permissions:
   contents: write
@@ -57,4 +69,7 @@ jobs:
           LCD_PRIMARY: ${{ inputs.lcd_primary }}
           LCD_FALLBACK: ${{ inputs.lcd_fallback }}
           SEED_MAX_PAGES: ${{ inputs.seed_max_pages }}
+          PAGER_RETRIES: ${{ inputs.pager_retries }}
+          PAGER_ERR_BACKOFF: ${{ inputs.pager_err_backoff }}
+          PAGER_PROBE_DELAY: ${{ inputs.pager_probe_delay }}
         run: node tla-history-backfill.js
