@@ -78,7 +78,7 @@ const SEED_MAX_PAGES = Number(process.env.SEED_MAX_PAGES || 400); // hard page c
 const PAGE_LIMIT    = 100;
 const HTTP_TIMEOUT_MS = 25000;
 const RETRIES       = 4;
-const WATCHDOG_MS   = 9 * 60 * 1000; // 9-min hard ceiling (Render-cost guard)
+const WATCHDOG_MS   = Number(process.env.WATCHDOG_MS || 20 * 60 * 1000); // 20-min default; seed pages ~290 pages. Action allows 350 min. Partial runs self-heal on re-run (dedup).
 const SCHEMA_VERSION = 1;
 const FORWARD_CADENCE_HOURS = 6;     // forward maintenance cadence (tune in Render)
 
@@ -86,17 +86,29 @@ const FORWARD_CADENCE_HOURS = 6;     // forward maintenance cadence (tune in Ren
 // captured losslessly (raw_msg kept) and counted in discovered_actions, so an
 // unexpected key surfaces in the heartbeat instead of being silently dropped.
 // (Eris ve3 naming; confirm via PROBE_ONLY before the first seed.)
+// CHAIN-CONFIRMED via probe (2026-06-15) against the live gauge + escrow.
+// Vote is the only vote-class verb; the rest below are the real lock verbs.
 const VOTE_ACTION_KEYS = {
-    vote: 'vote', place_vote: 'vote', place_votes: 'vote', update_vote: 'vote', update_votes: 'vote',
+    vote: 'vote',
 };
+// Lock verbs (top-level msgs on the voting escrow). claim_rebase is intentionally
+// NOT typed here (reward claim, high-volume) — it still shows in discovered_actions.
 const LOCK_ACTION_KEYS = {
-    create_lock: 'lock_create', deposit_for: 'lock_deposit_for',
-    extend_lock_amount: 'lock_extend_amount', extend_lock_time: 'lock_extend_time',
-    relock: 'relock', merge_lock: 'merge', merge: 'merge',
+    create_lock: 'lock_create',
+    extend_lock_amount: 'lock_extend_amount',
+    extend_lock_time: 'lock_extend_time',
+    merge_lock: 'merge',
+    split_lock: 'split',
+    migrate_lock: 'migrate',
+    lock_permanent: 'lock_permanent',     // auto-max ON
+    unlock_permanent: 'unlock_permanent', // auto-max OFF (starts decaying)
     withdraw: 'withdraw', unlock: 'withdraw',
+    transfer_nft: 'lock_transfer',        // lock ownership change (CW721 transfer)
+    deposit_for: 'lock_deposit_for',
 };
-// CW20 send-hook inner keys (when a lock is funded by an LST cw20 `send`):
-const LOCK_HOOK_KEYS = { create_lock: 'lock_create', deposit_for: 'lock_deposit_for', extend_lock_amount: 'lock_extend_amount' };
+// CW20 send-hook inner keys (lock funded by an LST cw20 `send`) — confirmed:
+// create_lock and extend_lock_amount arrive this way.
+const LOCK_HOOK_KEYS = { create_lock: 'lock_create', extend_lock_amount: 'lock_extend_amount', deposit_for: 'lock_deposit_for' };
 
 // ----------------------------------------------------------------------------- http
 async function fetchJson(url, label = url, timeoutMs = HTTP_TIMEOUT_MS) {
@@ -223,7 +235,8 @@ function classifyVoteTxs(txResponses, discovered) {
             discovered[`gauge:${key}`] = (discovered[`gauge:${key}`] || 0) + 1;
             const type = VOTE_ACTION_KEYS[key];
             if (type !== 'vote') continue; // only vote-class msgs become vote events; rest just counted
-            events.push({ type: 'vote', wallet: m.sender, ...meta, votes: extractVotes(msg[key]), raw_msg: extractVotes(msg[key]) ? undefined : msg[key] });
+            const a = msg[key] || {};
+            events.push({ type: 'vote', wallet: m.sender, ...meta, gauge: a.gauge ?? null, votes: extractVotes(a), raw_msg: extractVotes(a) ? undefined : a });
         }
     }
     return events;
@@ -244,7 +257,12 @@ function classifyLockTxs(txResponses, discovered) {
                 const innerKey = inner ? Object.keys(inner)[0] : null;
                 discovered[`escrow_hook:${innerKey || 'undecodable'}`] = (discovered[`escrow_hook:${innerKey || 'undecodable'}`] || 0) + 1;
                 const type = innerKey && LOCK_HOOK_KEYS[innerKey];
-                if (type) { events.push({ type, wallet: m.sender, ...meta, asset: inner[innerKey]?.asset ? normalizeAssetId(inner[innerKey].asset) : null, amount: msg.send.amount != null ? Number(msg.send.amount) : null, args: inner[innerKey] }); matchedThisTx = true; }
+                if (type) { const ia = inner[innerKey] || {}; events.push({ type, wallet: m.sender, ...meta,
+                    token_id: ia.token_id != null ? String(ia.token_id) : null,
+                    asset: m.contract ? `cw20:${m.contract}` : null, // the LST cw20 that was `send`-ed
+                    amount: msg.send.amount != null ? Number(msg.send.amount) : null,
+                    lock_seconds: ia.time != null ? Number(ia.time) : null,
+                    funded_by_cw20: true, args: ia }); matchedThisTx = true; }
                 continue;
             }
             discovered[`escrow:${key}`] = (discovered[`escrow:${key}`] || 0) + 1;
@@ -253,9 +271,12 @@ function classifyLockTxs(txResponses, discovered) {
             const a = msg[key] || {};
             events.push({ type, wallet: m.sender, ...meta,
                 token_id: a.token_id != null ? String(a.token_id) : (a.lock_id != null ? String(a.lock_id) : null),
+                token_id_add: a.token_id_add != null ? String(a.token_id_add) : null, // merge_lock
                 asset: a.asset ? normalizeAssetId(a.asset) : null,
-                amount: a.amount != null ? Number(a.amount) : null,
-                end_period: a.time != null ? a.time : (a.unlock_period ?? a.period ?? null),
+                into_asset: a.into ? normalizeAssetId(a.into) : null,               // migrate_lock target LST
+                amount: a.amount != null ? Number(a.amount) : null,                 // split_lock / create_lock
+                lock_seconds: a.time != null ? Number(a.time) : null,               // duration in SECONDS (not a period)
+                recipient: a.recipient || null,                                     // transfer_nft
                 args: a });
             matchedThisTx = true;
         }
@@ -295,15 +316,18 @@ function makeEpochResolver(epochDates) {
 function buildRollups(voteEvents, lockEvents, epochOf) {
     const wallets = {};
     const w = (addr) => (wallets[addr] ||= { wallet: addr, vote_count: 0, first_vote_epoch: null, last_vote_epoch: null, pools_voted: {}, vote_changes: 0, locks: [], first_lock_ts: null });
-    let prevByWallet = {};
+    let prevByWalletGauge = {};
     for (const e of voteEvents) {
         if (!e.wallet) continue;
         const r = w(e.wallet); r.vote_count++;
         const ep = epochOf(e.timestamp);
         if (ep != null) { if (r.first_vote_epoch == null || ep < r.first_vote_epoch) r.first_vote_epoch = ep; if (r.last_vote_epoch == null || ep > r.last_vote_epoch) r.last_vote_epoch = ep; }
+        // churn is per (wallet, gauge-bucket): a wallet votes once per bucket, so
+        // comparing across buckets would false-flag a change. Key by wallet|gauge.
+        const gkey = `${e.wallet}|${e.gauge ?? ''}`;
         const sig = JSON.stringify((e.votes || []).slice().sort());
-        if (prevByWallet[e.wallet] != null && prevByWallet[e.wallet] !== sig) r.vote_changes++;
-        prevByWallet[e.wallet] = sig;
+        if (prevByWalletGauge[gkey] != null && prevByWalletGauge[gkey] !== sig) r.vote_changes++;
+        prevByWalletGauge[gkey] = sig;
         for (const [asset] of (e.votes || [])) if (asset) r.pools_voted[asset] = (r.pools_voted[asset] || 0) + 1;
     }
     for (const e of lockEvents) {
