@@ -74,11 +74,8 @@ const EPOCH_DATES_URL = 'https://raw.githubusercontent.com/defipatriot/website-a
 
 const RUN_MODE      = (process.env.RUN_MODE || 'sample').toLowerCase(); // 'sample' = dry-run/probe (no write) | 'full' = seed/forward + write
 const PROBE_ONLY    = RUN_MODE === 'sample' || process.env.PROBE_ONLY === '1' || process.env.PROBE_ONLY === 'true';
-const SEED_MAX_PAGES = Number(process.env.SEED_MAX_PAGES || 400); // hard page ceiling per contract during seed
+const SEED_MAX_PAGES = Number(process.env.SEED_MAX_PAGES || 600); // page cap per query (gauge votes ~70p, escrow ~100p)
 const PAGE_LIMIT    = 100;
-const HTTP_TIMEOUT_MS = 25000;
-const RETRIES       = 4;
-const WATCHDOG_MS   = Number(process.env.WATCHDOG_MS || 20 * 60 * 1000); // 20-min default; seed pages ~290 pages. Action allows 350 min. Partial runs self-heal on re-run (dedup).
 const SCHEMA_VERSION = 1;
 const FORWARD_CADENCE_HOURS = 6;     // forward maintenance cadence (tune in Render)
 
@@ -111,72 +108,95 @@ const LOCK_ACTION_KEYS = {
 const LOCK_HOOK_KEYS = { create_lock: 'lock_create', extend_lock_amount: 'lock_extend_amount', deposit_for: 'lock_deposit_for' };
 
 // ----------------------------------------------------------------------------- http
-async function fetchJson(url, label = url, timeoutMs = HTTP_TIMEOUT_MS) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-        const res = await fetch(url, { signal: controller.signal, headers: { 'Accept': 'application/json', 'User-Agent': 'aDAO-tla-history-backfill/1.0' } });
-        if (!res.ok) { const body = await res.text().catch(() => ''); throw new Error(`HTTP ${res.status} ${body.slice(0, 120)}`); }
-        return await res.json();
-    } catch (e) {
-        if (e.name === 'AbortError') throw new Error(`Timeout (${label})`);
-        throw e;
-    } finally { clearTimeout(timeout); }
+// Proven resilient transport from the nft backfills: keep-alive single socket,
+// short timeout, many FAST retries (publicnode is flaky per-request but quick).
+const KEEPALIVE_AGENT = new https.Agent({ keepAlive: true, maxSockets: 1, keepAliveMsecs: 30000 });
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+function httpGet(url, t = 20000) {
+    return new Promise((res, rej) => {
+        const r = https.get(url, { agent: KEEPALIVE_AGENT, headers: { Accept: 'application/json', Connection: 'keep-alive', 'User-Agent': 'aDAO-tla-history-backfill/2.0' } }, (x) => {
+            let b = ''; x.on('data', c => b += c); x.on('end', () => {
+                if (x.statusCode >= 200 && x.statusCode < 300) { try { res(JSON.parse(b)); } catch { rej(new Error('bad JSON')); } }
+                else rej(new Error(`HTTP ${x.statusCode} ${b.slice(0, 120)}`)); });
+        });
+        r.on('error', rej); r.setTimeout(t, () => r.destroy(new Error('timeout')));
+    });
 }
-async function fetchJsonWithRetry(url, label, maxTries = RETRIES) {
-    let lastErr;
-    for (let attempt = 1; attempt <= maxTries; attempt++) {
-        try { return await fetchJson(url, label); }
-        catch (e) { lastErr = e; if (attempt < maxTries) await new Promise(r => setTimeout(r, Math.pow(3, attempt - 1) * 500)); }
-    }
-    throw lastErr;
-}
-async function tryFetchJson(url, label) { try { return await fetchJson(url, label); } catch (e) { console.warn(`  ⚠ ${label} fetch failed (non-fatal): ${e.message}`); return null; } }
+async function lcdGet(p, label) { try { return await httpGet(TERRA_LCD_PRIMARY + p); } catch (e) { try { return await httpGet(TERRA_LCD_FALLBACK + p); } catch (e2) { throw new Error(`${label}: both LCDs failed (${e2.message})`); } } }
+async function tryGetJson(url, label) { try { return await httpGet(url); } catch (e) { console.warn(`  ⚠ ${label} fetch failed (non-fatal): ${e.message}`); return null; } }
 
-// ----------------------------------------------------------------------------- tx_search
-// One page of txs for a contract, NEWEST-FIRST. Returns:
-//   { txs: [...] }        success (possibly empty array = genuine end)
-//   null                  query FAILED (both LCDs) — caller must NOT treat as end (F2)
-async function txSearchPage(contract, page) {
-    const q = `wasm._contract_address='${contract}'`;
-    const path = `/cosmos/tx/v1beta1/txs?query=${encodeURIComponent(q)}&order_by=ORDER_BY_DESC&page=${page}&limit=${PAGE_LIMIT}`;
-    for (const base of [TERRA_LCD_PRIMARY, TERRA_LCD_FALLBACK]) {
-        try {
-            const res = await fetchJsonWithRetry(base + path, `tx_search ${contract.slice(0,12)} p${page}`);
-            // success shape — distinguish "no data" ([]) from a malformed/failed body (null)
-            const txs = Array.isArray(res?.tx_responses) ? res.tx_responses : null;
-            if (txs === null) continue; // try fallback LCD before declaring failure
-            return { txs, total: res.total != null ? Number(res.total) : null };
-        } catch (e) { /* try fallback */ }
-    }
-    return null; // F2: both LCDs failed → null, NOT []
-}
+// ----------------------------------------------------------------------------- tx_search (resilient pager)
+// Adapted verbatim-in-spirit from nft-provenance-backfill.js's fetchAllTxs — the
+// pager that fixed publicnode's pagination quirk (it IGNORES offset; deep DESC
+// paging returns inconsistent slices). Pages ASCending (oldest-first, stable),
+// reprobes page 1 for the deepest archive, then walks forward by frontier height,
+// rejecting regressions/far-jumps. Returns ALL txs (deduped, height-sorted) and a
+// `stop` reason. `conds` are query terms ANDed together.
+async function fetchAllTxs(conds, label) {
+    const RETRIES = +(process.env.PAGER_RETRIES || 40), ROUNDS = +(process.env.PAGER_ROUNDS || 2);
+    const ERR_BACKOFF = +(process.env.PAGER_ERR_BACKOFF || 250), PROBE_DELAY = +(process.env.PAGER_PROBE_DELAY || 40);
+    const CONTIG_DELTA = 250000, P1_STABLE = 12;
+    const txPath = (page) => `/cosmos/tx/v1beta1/txs?query=${encodeURIComponent(conds.join(' AND '))}&order_by=ORDER_BY_ASC&page=${page}&limit=${PAGE_LIMIT}`;
+    const out = [], seen = new Set();
+    const stats = { calls: 0, pages: 0, regress: 0, far: 0, dup: 0, empty: 0, error: 0, reprobe: 0 };
+    let frontier = 0, globalMax = 0, stop = 'complete';
+    const scan = (batch) => { let freshMin = Infinity, fresh = 0; for (const tx of batch) { const h = Number(tx.height); if (h > globalMax) globalMax = h; if (!seen.has(tx.txhash)) { fresh++; if (h < freshMin) freshMin = h; } } return { fresh, freshMin }; };
+    const commit = (batch) => { let added = 0; for (const tx of batch) { const h = Number(tx.height); if (h > frontier) frontier = h; if (!seen.has(tx.txhash)) { seen.add(tx.txhash); out.push(tx); added++; } } stats.pages++; return added; };
 
-// Scan a contract NEWEST-FIRST, stopping when we drop to/below sinceHeight.
-// Returns { txs, complete, horizonHeight }. complete=false means a page failed
-// or we hit the page ceiling (=> partial; do NOT advance scan height past a gap).
-async function scanContract(contract, sinceHeight, deadline) {
-    const collected = [];
-    let complete = true, horizonHeight = null, total = null;
-    const maxPages = sinceHeight > 0 ? 60 : SEED_MAX_PAGES; // forward runs need few pages; seed needs many
-    for (let page = 1; page <= maxPages; page++) {
-        if (Date.now() > deadline) { complete = false; console.warn(`  ⚠ ${contract.slice(0,12)}: watchdog hit on page ${page}`); break; }
-        const res = await txSearchPage(contract, page);
-        if (res === null) { complete = false; console.warn(`  ⚠ ${contract.slice(0,12)}: page ${page} FAILED (both LCDs) — partial scan`); break; }
-        if (total == null) total = res.total;
-        const txs = res.txs;
-        if (txs.length === 0) break;                 // genuine end of history
-        for (const tr of txs) {
-            const h = Number(tr.height);
-            if (horizonHeight == null || h < horizonHeight) horizonHeight = h;
-            if (h > sinceHeight) collected.push(tr);
+    // page 1: deepest archive wins; early-break once the smallest start-height stabilizes
+    let best1 = null, noImprove = 0, nonEmpty = 0;
+    for (let a = 0; a < RETRIES; a++) {
+        stats.calls++;
+        let resp; try { resp = await lcdGet(txPath(1), `${label} p1.${a}`); } catch { stats.error++; await sleep(ERR_BACKOFF); continue; }
+        const batch = resp?.tx_responses || [];
+        if (!batch.length) { stats.empty++; await sleep(ERR_BACKOFF); continue; }
+        scan(batch); nonEmpty++;
+        const minH = Math.min(...batch.map(t => Number(t.height)));
+        if (!best1 || minH < best1.minH) { best1 = { batch, minH }; noImprove = 0; } else { noImprove++; }
+        if (a % 8 === 7) console.log(`  ${label}: probing page 1… best start-height=${best1 ? best1.minH : 'n/a'} (${a + 1} probes)`);
+        if (nonEmpty >= 3 && noImprove >= P1_STABLE) break;
+        await sleep(PROBE_DELAY);
+    }
+    if (!best1) { console.warn(`  ⚠ ${label}: page 1 unreachable after ${RETRIES} tries (treating as empty)`); return { txs: [], stop: 'p1-unreachable', globalMax: 0 }; }
+    commit(best1.batch);
+    console.log(`  ${label}: page1 start-height=${best1.minH} (${out.length} txs, frontier=${frontier})`);
+
+    for (let page = 2; page < SEED_MAX_PAGES; page++) {
+        const avg = out.length > 1 ? Math.max(1, (frontier - Number(out[0].height)) / (out.length - 1)) : 1;
+        const TIGHT = Math.max(2000, 3 * avg), LOOSE = Math.max(50000, 10 * avg);
+        let bestCand = null, rounds = 0;
+        do {
+            if (rounds > 0) stats.reprobe++;
+            for (let a = 0; a < RETRIES; a++) {
+                stats.calls++;
+                let resp; try { resp = await lcdGet(txPath(page), `${label} p${page}.${a}`); } catch { stats.error++; await sleep(ERR_BACKOFF); continue; }
+                const batch = resp?.tx_responses || [];
+                if (!batch.length) { stats.empty++; await sleep(ERR_BACKOFF); continue; }
+                const { fresh, freshMin } = scan(batch);
+                if (fresh === 0) { stats.dup++; await sleep(PROBE_DELAY); continue; }
+                if (freshMin < frontier) { stats.regress++; await sleep(PROBE_DELAY); continue; }
+                if (freshMin - frontier > CONTIG_DELTA) { stats.far++; await sleep(PROBE_DELAY); continue; }
+                if (!bestCand || freshMin < bestCand.freshMin) bestCand = { batch, freshMin };
+                if (bestCand.freshMin - frontier <= TIGHT) break;
+                await sleep(PROBE_DELAY);
+            }
+            rounds++;
+        } while (frontier < globalMax && rounds < ROUNDS && (!bestCand || bestCand.freshMin - frontier > LOOSE));
+
+        if (bestCand) {
+            const added = commit(bestCand.batch);
+            if (page % 10 === 0 || added === 0) console.log(`  ${label}: ${out.length} txs (page ${page}, frontier=${frontier}, +${added})`);
+            if (page === SEED_MAX_PAGES - 1) { stop = 'page-cap'; console.warn(`  ⚠ ${label} hit page cap (${SEED_MAX_PAGES})`); }
+            continue;
         }
-        const pageMin = Math.min(...txs.map(tr => Number(tr.height)));
-        if (pageMin <= sinceHeight) break;           // newest-first: covered the new region
-        if (txs.length < PAGE_LIMIT) break;          // last page
-        if (page === maxPages) { complete = false; console.warn(`  ⚠ ${contract.slice(0,12)}: hit page ceiling ${maxPages} — horizon = height ${horizonHeight}`); }
+        if (frontier >= globalMax) { stop = 'clean-end'; break; }
+        stop = `stuck@page${page}`;
+        console.warn(`  ⚠ ${label}: STUCK at page ${page} — frontier ${frontier} < globalMax ${globalMax}`);
+        break;
     }
-    return { txs: collected, complete, horizonHeight, total };
+    out.sort((a, b) => Number(a.height) - Number(b.height) || (a.txhash < b.txhash ? -1 : 1));
+    console.log(`  ${label}: DONE — ${out.length} txs | stop=${stop} | pages=${stats.pages} calls=${stats.calls} reprobe=${stats.reprobe} regress=${stats.regress} far=${stats.far} dup=${stats.dup} empty=${stats.empty} error=${stats.error}`);
+    return { txs: out, stop, globalMax };
 }
 
 // ----------------------------------------------------------------------------- msg decoding
@@ -367,14 +387,15 @@ const RAW = (file) => `https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB
 
 // ----------------------------------------------------------------------------- probe mode
 async function runProbe() {
-    console.log('🔬 PROBE_ONLY — scanning recent txs per contract; writing nothing.\n');
+    console.log('🔬 sample/probe — scanning recent txs per contract; writing nothing.\n');
     for (const [name, addr] of [['gauge controller', TLA_GAUGE_CONTROLLER], ['voting escrow', TLA_VOTING_ESCROW]]) {
         console.log(`── ${name}  (${addr})`);
-        const res = await txSearchPage(addr, 1);
-        if (res === null) { console.log('   ✗ both LCDs failed\n'); continue; }
-        console.log(`   total txs (LCD reports): ${res.total ?? 'n/a'};  sampling ${res.txs.length}`);
+        const path = `/cosmos/tx/v1beta1/txs?query=${encodeURIComponent(`wasm._contract_address='${addr}'`)}&order_by=ORDER_BY_DESC&page=1&limit=${PAGE_LIMIT}`;
+        let res = null; try { res = await lcdGet(path, `probe ${name}`); } catch (e) { console.log(`   ✗ both LCDs failed: ${e.message}\n`); continue; }
+        const txs = res?.tx_responses || [];
+        console.log(`   total txs (LCD reports): ${res?.total ?? 'n/a'};  sampling ${txs.length}`);
         const seen = {};
-        for (const tr of res.txs) {
+        for (const tr of txs) {
             for (const m of tr?.tx?.body?.messages || []) {
                 const msg = m?.msg; if (!msg || typeof msg !== 'object') continue;
                 const key = Object.keys(msg)[0]; if (!key) continue;
@@ -385,13 +406,12 @@ async function runProbe() {
         }
         console.log(`   counts: ${JSON.stringify(seen)}\n`);
     }
-    console.log('Map any unrecognized keys into VOTE_ACTION_KEYS / LOCK_ACTION_KEYS, then run the real seed.');
+    console.log('Action keys are already mapped (confirmed 2026-06-15). Run RUN_MODE=full to seed.');
 }
 
 // ----------------------------------------------------------------------------- main
 async function run() {
     const startedAt = new Date();
-    const deadline = Date.now() + WATCHDOG_MS;
     const errors = new ErrorLog();
     const discovered = {};
     console.log(`\n📜 tla-history-backfill — ${startedAt.toISOString()}\n`);
@@ -401,23 +421,33 @@ async function run() {
 
     // load prior state (committed event logs) + epoch dates
     const [priorVotes, priorLocks, epochDates] = await Promise.all([
-        tryFetchJson(RAW('data/vote-events.json'), 'prior vote-events'),
-        tryFetchJson(RAW('data/lock-events.json'), 'prior lock-events'),
-        tryFetchJson(EPOCH_DATES_URL, 'epoch dates'),
+        tryGetJson(RAW('data/vote-events.json'), 'prior vote-events'),
+        tryGetJson(RAW('data/lock-events.json'), 'prior lock-events'),
+        tryGetJson(EPOCH_DATES_URL, 'epoch dates'),
     ]);
     const epochOf = makeEpochResolver(epochDates);
-
-    const voteState = { lastScannedHeight: priorVotes?.lastScannedHeight || 0, events: priorVotes?.events || [], horizonHeight: priorVotes?.horizonHeight ?? null };
-    const lockState = { lastScannedHeight: priorLocks?.lastScannedHeight || 0, events: priorLocks?.events || [], horizonHeight: priorLocks?.horizonHeight ?? null };
+    const voteState = { events: priorVotes?.events || [] };
+    const lockState = { events: priorLocks?.events || [] };
     const runMode = (voteState.events.length === 0 && lockState.events.length === 0) ? 'seed' : 'forward';
-    console.log(`   mode: ${runMode}  (prior votes=${voteState.events.length}, locks=${lockState.events.length})`);
+    console.log(`   mode: ${runMode}  (prior votes=${voteState.events.length}, locks=${lockState.events.length})\n`);
 
-    // scan both contracts
-    const gauge = await scanContract(TLA_GAUGE_CONTROLLER, voteState.lastScannedHeight, deadline);
-    const escrow = await scanContract(TLA_VOTING_ESCROW,   lockState.lastScannedHeight, deadline);
-    console.log(`   gauge: +${gauge.txs.length} txs (complete=${gauge.complete})  |  escrow: +${escrow.txs.length} txs (complete=${escrow.complete})`);
+    // Full-history sweep of each contract (ASC resilient pager). Votes are gauge-
+    // only → filter to wasm.action='vote' (cuts ~19k gauge txs to just votes). If
+    // the filter ever returns nothing, fall back to an unfiltered gauge sweep.
+    console.log('🗳  scanning gauge for votes…');
+    let gauge = await fetchAllTxs([`wasm._contract_address='${TLA_GAUGE_CONTROLLER}'`, `wasm.action='vote'`], 'gauge-votes');
+    if (gauge.txs.length === 0 && gauge.stop !== 'clean-end') {
+        console.warn('  ⚠ vote-filtered gauge sweep empty — retrying UNFILTERED');
+        gauge = await fetchAllTxs([`wasm._contract_address='${TLA_GAUGE_CONTROLLER}'`], 'gauge-all');
+    }
+    console.log('\n🔒 scanning escrow for locks…');
+    const escrow = await fetchAllTxs([`wasm._contract_address='${TLA_VOTING_ESCROW}'`], 'escrow-locks');
 
-    // classify
+    const gaugeComplete  = gauge.stop === 'complete' || gauge.stop === 'clean-end';
+    const escrowComplete = escrow.stop === 'complete' || escrow.stop === 'clean-end';
+    console.log(`\n   gauge: ${gauge.txs.length} txs (${gauge.stop})  |  escrow: ${escrow.txs.length} txs (${escrow.stop})`);
+
+    // classify (votes from gauge, locks from escrow)
     const freshVotes = classifyVoteTxs(gauge.txs, discovered);
     const freshLocks = classifyLockTxs(escrow.txs, discovered);
 
@@ -433,34 +463,26 @@ async function run() {
         throw new Error('F3 shrink guard: refusing to overwrite history with fewer events.');
     }
 
-    // advance scan height only on a COMPLETE scan (else leave a gap to re-cover next run — F1/F2)
-    const newVoteHeight = gauge.complete ? Math.max(voteState.lastScannedHeight, ...(gauge.txs.length ? gauge.txs.map(t => Number(t.height)) : [voteState.lastScannedHeight])) : voteState.lastScannedHeight;
-    const newLockHeight = escrow.complete ? Math.max(lockState.lastScannedHeight, ...(escrow.txs.length ? escrow.txs.map(t => Number(t.height)) : [lockState.lastScannedHeight])) : lockState.lastScannedHeight;
-    const voteHorizon = minDefined(voteState.horizonHeight, gauge.horizonHeight);
-    const lockHorizon = minDefined(lockState.horizonHeight, escrow.horizonHeight);
-    const complete = gauge.complete && escrow.complete;
-
-    const voteFile = { schemaVersion: SCHEMA_VERSION, builtAt: startedAt.toISOString(), contract: TLA_GAUGE_CONTROLLER, lastScannedHeight: newVoteHeight, horizonHeight: voteHorizon, scan_complete: gauge.complete, count: vm.merged.length, events: vm.merged };
-    const lockFile = { schemaVersion: SCHEMA_VERSION, builtAt: startedAt.toISOString(), contract: TLA_VOTING_ESCROW, lastScannedHeight: newLockHeight, horizonHeight: lockHorizon, scan_complete: escrow.complete, count: lm.merged.length, events: lm.merged };
+    const earliest = (txs) => txs.length ? Number(txs[0].height) : null; // pager returns ASC-sorted
+    const complete = gaugeComplete && escrowComplete;
+    const voteFile = { schemaVersion: SCHEMA_VERSION, builtAt: startedAt.toISOString(), contract: TLA_GAUGE_CONTROLLER, lastScannedHeight: gauge.globalMax || 0, horizonHeight: earliest(gauge.txs), scan_complete: gaugeComplete, scan_stop: gauge.stop, count: vm.merged.length, events: vm.merged };
+    const lockFile = { schemaVersion: SCHEMA_VERSION, builtAt: startedAt.toISOString(), contract: TLA_VOTING_ESCROW, lastScannedHeight: escrow.globalMax || 0, horizonHeight: earliest(escrow.txs), scan_complete: escrowComplete, scan_stop: escrow.stop, count: lm.merged.length, events: lm.merged };
     const rollups = buildRollups(vm.merged, lm.merged, epochOf);
 
     await publishFile(`${YEAR_DIR}/data/vote-events.json`, voteFile, `vote-events ${runMode}: ${vm.merged.length} (+${vm.added})`);
     await publishFile(`${YEAR_DIR}/data/lock-events.json`, lockFile, `lock-events ${runMode}: ${lm.merged.length} (+${lm.added})`);
     await publishFile(`${YEAR_DIR}/data/rollups.json`, rollups, `rollups: ${rollups.wallet_count} wallets`);
 
-    // per-day delta archive (append-only)
     if (vm.added || lm.added) {
         const day = startedAt.toISOString().slice(0, 10);
         await publishFile(`${YEAR_DIR}/daily/${day}.json`, { day, runMode, votes_added: vm.added, locks_added: lm.added, vote_total: vm.merged.length, lock_total: lm.merged.length, builtAt: startedAt.toISOString() }, `daily delta ${day}`).catch(e => errors.add('daily archive', e));
     }
 
-    await publishHeartbeat({ startedAt, runMode, status: complete ? 'ok' : 'partial', errors, discovered, voteCount: vm.merged.length, lockCount: lm.merged.length, voteHorizon, lockHorizon, newVoteHeight, newLockHeight });
+    await publishHeartbeat({ startedAt, runMode, status: complete ? 'ok' : 'partial', errors, discovered, voteCount: vm.merged.length, lockCount: lm.merged.length, voteHorizon: earliest(gauge.txs), lockHorizon: earliest(escrow.txs), newVoteHeight: gauge.globalMax || 0, newLockHeight: escrow.globalMax || 0 });
 
     console.log(`\n✅ done — votes ${vm.merged.length}, locks ${lm.merged.length}, wallets ${rollups.wallet_count}, status ${complete ? 'ok' : 'PARTIAL'}`);
     if (Object.keys(discovered).length) console.log(`   discovered_actions: ${JSON.stringify(discovered)}`);
 }
-
-function minDefined(a, b) { const xs = [a, b].filter(v => v != null); return xs.length ? Math.min(...xs) : null; }
 
 async function publishHeartbeat({ startedAt, runMode, status, errors, discovered, voteCount, lockCount, voteHorizon, lockHorizon, newVoteHeight, newLockHeight, note }) {
     const hb = {
