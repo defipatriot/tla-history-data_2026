@@ -1,1 +1,60 @@
-place
+name: TLA History Backfill (one-time)
+
+# Manual-only one-shot (then optional re-runs for forward maintenance).
+# Reconstructs vote + lock EVENT history from the permanent tx log via tx_search.
+# Run RUN_MODE=sample first to confirm the execute-msg action keys, then full.
+# Safe to re-run: outputs are append-only + shrink-guarded.
+# This workflow + tla-history-backfill.js + package.json live in the DATA repo
+# (defipatriot/tla-history-data_2026), exactly like the nft backfills.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "sample = dry-run / probe (prints action keys, writes nothing) | full = seed/forward + write"
+        type: choice
+        default: sample
+        options: [sample, full]
+      lcd_primary:
+        description: "Primary LCD endpoint"
+        type: string
+        default: "https://terra-lcd.publicnode.com"
+      lcd_fallback:
+        description: "Fallback LCD endpoint"
+        type: string
+        default: "https://terra-rest.publicnode.com"
+      seed_max_pages:
+        description: "Hard page ceiling per contract during seed (100 txs/page)"
+        type: string
+        default: "400"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tla-history-backfill
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Checkout (gets the backfill script in this repo)
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run TLA history backfill
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPO: ${{ github.repository }}
+          GITHUB_BRANCH: ${{ github.ref_name }}
+          RUN_MODE: ${{ inputs.mode }}
+          LCD_PRIMARY: ${{ inputs.lcd_primary }}
+          LCD_FALLBACK: ${{ inputs.lcd_fallback }}
+          SEED_MAX_PAGES: ${{ inputs.seed_max_pages }}
+        run: node tla-history-backfill.js
