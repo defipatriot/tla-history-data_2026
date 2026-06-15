@@ -1,0 +1,11 @@
+{
+  "name": "tla-history-backfill",
+  "version": "1.0.0",
+  "description": "Vote + lock EVENT history backfill (behavioral, ungameable) for TLA — seed-once then forward-maintain from the permanent tx log",
+  "main": "tla-history-backfill.js",
+  "scripts": {
+    "start": "node tla-history-backfill.js",
+    "probe": "PROBE_ONLY=1 node tla-history-backfill.js"
+  },
+  "license": "MIT"
+}
