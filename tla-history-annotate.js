@@ -39,9 +39,23 @@ function gh(method, apiPath, body) {
         req.on('error', reject); if (body) req.write(JSON.stringify(body)); req.end();
     });
 }
+// raw.githubusercontent.com has NO 1 MB size cap (the Contents API does — it
+// returns empty `content` for files >1 MB, which is why we read raw here).
+function rawGet(url) {
+    return new Promise((resolve, reject) => {
+        https.get(url, { headers: { 'User-Agent': 'aDAO-annotate', Accept: 'application/json' } }, res => {
+            if (res.statusCode < 200 || res.statusCode >= 300) { res.resume(); return reject(new Error(`raw GET ${res.statusCode}`)); }
+            let d = ''; res.on('data', c => d += c); res.on('end', () => resolve(d));
+        }).on('error', reject);
+    });
+}
 async function getFile(path) {
-    const r = await gh('GET', `/repos/${GITHUB_REPO}/contents/${path}?ref=${GITHUB_BRANCH}`);
-    return { json: JSON.parse(Buffer.from(r.content, 'base64').toString('utf8')), sha: r.sha };
+    // sha from Contents API metadata (present at any size); content from raw.
+    const meta = await gh('GET', `/repos/${GITHUB_REPO}/contents/${path}?ref=${GITHUB_BRANCH}`);
+    let text;
+    if (meta.content && meta.encoding === 'base64') text = Buffer.from(meta.content, 'base64').toString('utf8'); // small file: use inline
+    else text = await rawGet(`https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH}/${path}`);      // >1 MB: raw
+    return { json: JSON.parse(text), sha: meta.sha };
 }
 async function putFile(path, obj, sha, msg) {
     return gh('PUT', `/repos/${GITHUB_REPO}/contents/${path}`, { message: msg, branch: GITHUB_BRANCH, sha, content: Buffer.from(JSON.stringify(obj, null, 0)).toString('base64') });
