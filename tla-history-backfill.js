@@ -76,7 +76,7 @@ const RUN_MODE      = (process.env.RUN_MODE || 'sample').toLowerCase(); // 'samp
 const PROBE_ONLY    = RUN_MODE === 'sample' || process.env.PROBE_ONLY === '1' || process.env.PROBE_ONLY === 'true';
 const SEED_MAX_PAGES = Number(process.env.SEED_MAX_PAGES || 600); // page cap per query (gauge votes ~70p, escrow ~100p)
 const PAGE_LIMIT    = 100;
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2; // v2: lock events carry `canonical` (filter wrapper-layer dupes for VP math)
 const FORWARD_CADENCE_HOURS = 6;     // forward maintenance cadence (tune in Render)
 
 // Known execute-msg keys → normalized event type. Anything NOT here is still
@@ -261,6 +261,17 @@ function classifyVoteTxs(txResponses, discovered) {
     }
     return events;
 }
+// A lock event is "canonical" if it's the authoritative escrow record of a state
+// change (direct messages, cw20-hook funding, or the escrow's own `event:ve/*`).
+// Wrapper-layer events (votion-la/*, arb/*, launch-nft/*, ca/*) co-occur with a
+// canonical `ve/*` twin for the SAME deposit, so VP/lock-delta math must sum
+// canonical-only to avoid double-counting. The log keeps both (lossless); this
+// flag lets consumers filter. See LOCK CANONICAL note in README.
+function isCanonicalLock(type) {
+    if (!type.startsWith('event:')) return true;          // direct msg / cw20 hook
+    return type.startsWith('event:ve/');                   // escrow's own namespace
+}
+
 function classifyLockTxs(txResponses, discovered) {
     const events = [];
     for (const tr of txResponses) {
@@ -277,7 +288,7 @@ function classifyLockTxs(txResponses, discovered) {
                 const innerKey = inner ? Object.keys(inner)[0] : null;
                 discovered[`escrow_hook:${innerKey || 'undecodable'}`] = (discovered[`escrow_hook:${innerKey || 'undecodable'}`] || 0) + 1;
                 const type = innerKey && LOCK_HOOK_KEYS[innerKey];
-                if (type) { const ia = inner[innerKey] || {}; events.push({ type, wallet: m.sender, ...meta,
+                if (type) { const ia = inner[innerKey] || {}; events.push({ type, canonical: isCanonicalLock(type), wallet: m.sender, ...meta,
                     token_id: ia.token_id != null ? String(ia.token_id) : null,
                     asset: m.contract ? `cw20:${m.contract}` : null, // the LST cw20 that was `send`-ed
                     amount: msg.send.amount != null ? Number(msg.send.amount) : null,
@@ -289,7 +300,7 @@ function classifyLockTxs(txResponses, discovered) {
             const type = LOCK_ACTION_KEYS[key];
             if (!type) continue;
             const a = msg[key] || {};
-            events.push({ type, wallet: m.sender, ...meta,
+            events.push({ type, canonical: isCanonicalLock(type), wallet: m.sender, ...meta,
                 token_id: a.token_id != null ? String(a.token_id) : (a.lock_id != null ? String(a.lock_id) : null),
                 token_id_add: a.token_id_add != null ? String(a.token_id_add) : null, // merge_lock
                 asset: a.asset ? normalizeAssetId(a.asset) : null,
@@ -307,7 +318,7 @@ function classifyLockTxs(txResponses, discovered) {
             for (const act of acts) {
                 if (/lock|deposit|withdraw|relock|merge|extend/i.test(act)) {
                     discovered[`escrow_event:${act}`] = (discovered[`escrow_event:${act}`] || 0) + 1;
-                    events.push({ type: `event:${act}`, wallet: tr?.tx?.body?.messages?.[0]?.sender || null, ...meta, via: 'wasm_event', args_unknown: true });
+                    events.push({ type: `event:${act}`, canonical: isCanonicalLock(`event:${act}`), wallet: tr?.tx?.body?.messages?.[0]?.sender || null, ...meta, via: 'wasm_event', args_unknown: true });
                 }
             }
         }
@@ -353,7 +364,7 @@ function buildRollups(voteEvents, lockEvents, epochOf) {
     for (const e of lockEvents) {
         if (!e.wallet) continue;
         const r = w(e.wallet);
-        r.locks.push({ type: e.type, token_id: e.token_id ?? null, asset: e.asset ?? null, amount: e.amount ?? null, timestamp: e.timestamp, epoch: epochOf(e.timestamp), tx_hash: e.tx_hash });
+        r.locks.push({ type: e.type, canonical: e.canonical !== false, token_id: e.token_id ?? null, asset: e.asset ?? null, amount: e.amount ?? null, timestamp: e.timestamp, epoch: epochOf(e.timestamp), tx_hash: e.tx_hash });
         if (r.first_lock_ts == null || Date.parse(e.timestamp) < Date.parse(r.first_lock_ts)) r.first_lock_ts = e.timestamp;
     }
     // churn rate = changes / (votes-1), tidy pools list
@@ -503,4 +514,4 @@ if (require.main === module) {
     run().catch(err => { console.error('FATAL:', err.message); process.exit(1); });
 }
 
-module.exports = { classifyVoteTxs, classifyLockTxs, mergeEvents, buildRollups, extractVotes, normalizeAssetId, makeEpochResolver };
+module.exports = { classifyVoteTxs, classifyLockTxs, mergeEvents, buildRollups, extractVotes, normalizeAssetId, makeEpochResolver, isCanonicalLock };

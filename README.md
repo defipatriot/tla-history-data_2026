@@ -72,8 +72,18 @@ Running `RUN_MODE=sample` re-prints this discovery any time, writing nothing.
 ## Run modes
 
 - **`sample`** (default) — dry-run/probe: scans recent txs, prints action keys, writes nothing.
-- **`full`, no committed state** — SEED: replays history to the LCD horizon, publishes once. May take several minutes; `SEED_MAX_PAGES` (default 400) caps it — if hit, the run is `partial` and the next run continues from the horizon.
-- **`full`, state exists** — FORWARD: scans only new blocks above `lastScannedHeight`, appends, dedups by `tx_hash`.
+- **`full`** — seeds/maintains: full-history sweep of both contracts, classify, append, dedup, publish.
+
+### Pagination (the important bit)
+History is fetched with the **resilient ASC pager ported from the nft backfills** —
+it reprobes page 1 for the deepest archive and walks forward by block height,
+which is what survives publicnode's pagination quirk (it ignores `offset`; naive
+deep DESC paging returns inconsistent slices and crawls). The gauge is filtered
+server-side to `wasm.action='vote'` so it only pages vote txs (~70 pages) instead
+of all ~19k; the escrow is swept unfiltered (~100 pages). Tuning knobs (env /
+workflow inputs): `PAGER_RETRIES` (40), `PAGER_ERR_BACKOFF` (250 ms),
+`PAGER_PROBE_DELAY` (40 ms), `SEED_MAX_PAGES` (600). A full seed runs in a few
+minutes; re-runs are safe (append-only + dedup).
 
 ## Deploy (GitHub Actions — like the nft backfills)
 
@@ -96,14 +106,32 @@ automatically, the same script can run on a Render cron (`0 */6 * * *`) with env
 `GITHUB_REPO=defipatriot/tla-history-data_2026` (full owner prefix), `GITHUB_TOKEN`,
 `RUN_MODE=full`. It seed-or-forwards based on existing state, so nothing changes.
 
+## LOCK CANONICAL — read before summing VP / lock deltas
+
+Each lock event carries `canonical: true|false`. A single deposit can surface as
+several events in one tx: the escrow's own record (`event:ve/deposit_for`,
+`lock_create`, the cw20-hook create/extend…) **plus** wrapper-layer views of the
+*same* deposit (`event:votion-la/*`, `event:arb/*`, `event:launch-nft/*`,
+`event:ca/*`). All are kept (lossless) and namespaced, but they double-count the
+underlying delta. **Rule: when summing VP or lock amounts over time, filter to
+`canonical === true`.** For the current seed that's ~9,906 canonical vs ~1,614
+wrapper of 11,520. The classifier writes this flag natively (v2); the existing
+seed was retro-tagged once by `tla-history-annotate.js`.
+
 ## Consumers (next: the UI)
 
 - **Vote Intelligence** — vote-change frequency, votes on later-inactive LPs (join `rollups.pools_voted` against the active-pool set from `tla-snapshot`).
 - **Member tenure / behavior** — `first_vote_epoch` (also available natively via the gauge `user_first_participation` read) and lock timelines.
-- **Portfolio Tracker** — lock event timeline per member.
+- **Portfolio Tracker** — lock event timeline per member (sum `canonical === true` only).
 
 ## Recent changes
 
+- **2.0.0** — lock events now carry `canonical` (filter wrapper-layer dupes:
+  `votion-la/*`, `arb/*`, `launch-nft/*`, `ca/*` → `false`) so VP/lock-delta math
+  never double-counts. `rollups` lock entries tagged too. Resilient ASC pager
+  (ported from the nft backfills) replaces deep-DESC paging; gauge sweeps
+  unfiltered when the `wasm.action='vote'` filter returns empty. Existing seed
+  retro-tagged via `tla-history-annotate.js` (no re-seed).
 - **1.0.0** — initial build. Seed-once + forward-maintain; gauge-vote and escrow-
   lock classification (incl. cw20 send-hook locks); lossless `discovered_actions`;
   F1/F2/F3/F7/F8 guards; per-wallet rollups; `PROBE_ONLY` discovery mode. Pure
